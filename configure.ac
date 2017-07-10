@@ -1,13 +1,8 @@
-m4_define([tpm20_major_version], [1])
-m4_define([tpm20_minor_version], [0])
-m4_define([tpm20_version_string], [tpm20_major_version.tpm20_minor_version])
-
-AC_INIT([tpm2.0-tss], [tpm20_version_string])
+AC_INIT([tpm2.0-tss],
+        [m4_esyscmd_s([git describe --tags --always --dirty])])
 AC_CONFIG_MACRO_DIR([m4])
 AC_PROG_CC
 LT_INIT()
-AC_C_BIGENDIAN
-AX_PTHREAD([], [AC_MSG_ERROR([requires pthread])])
 AM_INIT_AUTOMAKE([foreign
                   subdir-objects])
 AC_CONFIG_FILES([Makefile])
@@ -22,6 +17,20 @@ AS_IF([test "x$enable_unit" != xno],
                          [AC_DEFINE([HAVE_CMOCKA],
                                     [1])])])
 AM_CONDITIONAL([UNIT], [test "x$enable_unit" != xno])
+#
+# simulator binary
+#
+AC_MSG_CHECKING([Checking for simulator binary: $with_simulatorbin])
+AC_ARG_WITH([simulatorbin],
+            [AS_HELP_STRING([--with-simulatorbin=tpm_server],[simulator executable])],
+            [AS_IF([test \( -f "$with_simulatorbin" \) -a \( -x "$with_simulatorbin" \)],
+                   [AC_MSG_RESULT([success])
+                    AC_SUBST([SIMULATOR_BIN],[$with_simulatorbin])
+                    AX_NORMALIZE_PATH([with_simulatorbin])
+                    with_simulatorbin_set=yes],
+                   [AC_MSG_ERROR([TPM simulator binary provided does not exist])])],
+            [with_simulatorbin_set=no])
+AM_CONDITIONAL([SIMULATOR_BIN],[test "x$with_simulatorbin_set" = "xyes"])
 
 AX_ADD_COMPILER_FLAG([-Wall])
 AX_ADD_COMPILER_FLAG([-Werror])

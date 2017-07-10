@@ -1,5 +1,5 @@
 //**********************************************************************;
-// Copyright (c) 2015, 2016 Intel Corporation
+// Copyright (c) 2015, 2016, 2017 Intel Corporation
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -31,16 +31,13 @@
 
 #include "sapi/tpm20.h"
 #include "sapi/marshal.h"
-#include "marshal/base-types.h"
 #include "tcti/tcti_socket.h"
 #include "sysapi_util.h"
 #include "common/debug.h"
 #include "commonchecks.h"
 #include "logging.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include "sockets.h"
+#include "tss2_endian.h"
 
 static TSS2_RC tctiRecvBytes( TSS2_TCTI_CONTEXT *tctiContext, SOCKET sock, unsigned char *data, int len )
 {
@@ -261,6 +258,14 @@ TSS2_RC SocketSetLocality(
     return rval;
 }
 
+TSS2_RC SocketGetPollHandles(
+    TSS2_TCTI_CONTEXT     *tctiContext,
+    TSS2_TCTI_POLL_HANDLE *handles,
+    size_t                *num_handles)
+{
+    return TSS2_TCTI_RC_NOT_IMPLEMENTED;
+}
+
 void SocketFinalize(
     TSS2_TCTI_CONTEXT *tctiContext       /* in */
     )
@@ -466,10 +471,6 @@ retSocketReceiveTpmResponse:
     return rval;
 }
 
-#ifdef __cplusplus
-}
-#endif
-
 #define HOSTNAME_LENGTH 200
 #define PORT_LENGTH 4
 
@@ -516,10 +517,18 @@ TSS2_RC InitSocketTcti (
     SOCKET otherSock;
     SOCKET tpmSock;
 
-    if( tctiContext == NULL )
+    if( tctiContext == NULL && contextSize == NULL )
+    {
+        return TSS2_TCTI_RC_BAD_VALUE;
+    }
+    else if( tctiContext == NULL )
     {
         *contextSize = sizeof( TSS2_TCTI_CONTEXT_INTEL );
         return TSS2_RC_SUCCESS;
+    }
+    else if( conf == NULL )
+    {
+        return TSS2_TCTI_RC_BAD_VALUE;
     }
     else
     {
@@ -530,7 +539,7 @@ TSS2_RC InitSocketTcti (
         TSS2_TCTI_RECEIVE( tctiContext ) = SocketReceiveTpmResponse;
         TSS2_TCTI_FINALIZE( tctiContext ) = SocketFinalize;
         TSS2_TCTI_CANCEL( tctiContext ) = SocketCancel;
-        TSS2_TCTI_GET_POLL_HANDLES( tctiContext ) = 0;
+        TSS2_TCTI_GET_POLL_HANDLES( tctiContext ) = SocketGetPollHandles;
         TSS2_TCTI_SET_LOCALITY( tctiContext ) = SocketSetLocality;
         ((TSS2_TCTI_CONTEXT_INTEL *)tctiContext)->status.debugMsgEnabled = 0;
         ((TSS2_TCTI_CONTEXT_INTEL *)tctiContext)->status.locality = 3;
@@ -545,7 +554,7 @@ TSS2_RC InitSocketTcti (
         TCTI_LOG_BUFFER_CALLBACK( tctiContext ) = conf->logBufferCallback;
         TCTI_LOG_DATA( tctiContext ) = conf->logData;
 
-        rval = (TSS2_RC) InitSockets( conf->hostname, conf->port, serverSockets, &otherSock, &tpmSock, TCTI_LOG_CALLBACK( tctiContext ), TCTI_LOG_DATA( tctiContext) );
+        rval = (TSS2_RC) InitSockets( conf->hostname, conf->port, &otherSock, &tpmSock, TCTI_LOG_CALLBACK( tctiContext ), TCTI_LOG_DATA( tctiContext) );
         if( rval == TSS2_RC_SUCCESS )
         {
             ((TSS2_TCTI_CONTEXT_INTEL *)tctiContext)->otherSock = otherSock;

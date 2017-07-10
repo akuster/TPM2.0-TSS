@@ -29,7 +29,12 @@
 // tpmclient.cpp : Defines the entry point for the console test application.
 //
 
-#include <stdarg.h>
+#ifdef NO_RM_TESTS
+#include "tpmclient_wo_rm.h"
+#else
+#define SESSIONS_COUNT 5
+#endif
+
 #include <stdbool.h>
 
 #ifndef UNICODE
@@ -43,13 +48,12 @@
 #include <stdlib.h>   // Needed for _wtoi
 #include <string.h>
 
-#include "marshal/base-types.h"
 #include "sapi/tpm20.h"
 #include "sysapi_util.h"
-#include "test/common/sample/sample.h"
-#include "resourcemgr/resourcemgr.h"
+#include "sample.h"
 #include "tpmclient.h"
-#include "common/tcti_util.h"
+#include "tcti_util.h"
+#include "tss2_endian.h"
 
 // This is done to allow the tests to access fields
 // in the sysContext structure that are needed for
@@ -61,7 +65,7 @@
 
 #include "tcti/tcti_device.h"
 #include "tcti/tcti_socket.h"
-#include "common/syscontext.h"
+#include "syscontext.h"
 #include "common/debug.h"
 
 //
@@ -98,10 +102,6 @@ char errorString[errorStringSize];
 
 UINT8 simulator = 1;
 
-#if __linux || __unix
-UINT8 testLocalTcti = 0;
-#endif
-
 UINT32 tpmMaxResponseLen = TPMBUF_LEN;
 
 UINT8 resMgrInitialized = 0;
@@ -114,16 +114,14 @@ TPM2B_AUTH loadedSha1KeyAuth;
 
 TPM_HANDLE handle1024, handle2048sha1, handle2048rsa;
 
-UINT32 passCount = 1;
 UINT32 demoDelay = 0;
-int debugLevel = 0;
 UINT8 indent = 0;
 
 TSS2_SYS_CONTEXT *sysContext;
 
 TCTI_SOCKET_CONF rmInterfaceConfig = {
     DEFAULT_HOSTNAME,
-    DEFAULT_RESMGR_TPM_PORT,
+    DEFAULT_SIMULATOR_TPM_PORT,
     DebugPrintfCallback,
     DebugPrintBufferCallback,
     NULL
@@ -255,8 +253,6 @@ void ErrorHandler( UINT32 rval )
     sprintf_s( errorString, errorStringSize, "%s Error: 0x%x\n", levelString, rval );
 }
 
-char resMgrInterfaceName[] = "Resource Manager";
-
 TSS2_RC InitTctiResMgrContext( TCTI_SOCKET_CONF *rmInterfaceConfig, TSS2_TCTI_CONTEXT **tctiContext, char *name )
 {
     size_t size;
@@ -311,21 +307,21 @@ void Delay( UINT16 delay)
     }
 }
 
-void CheckPassed( UINT32 rval )
-{
-    DebugPrintf( NO_PREFIX, "\tpassing case:  " );
-    if ( rval != TPM_RC_SUCCESS) {
-        ErrorHandler( rval);
-        DebugPrintf( NO_PREFIX, "\tFAILED!  %s\n", errorString );
-        Cleanup();
-    }
-    else
-    {
-        DebugPrintf( NO_PREFIX, "\tPASSED!\n" );
-    }
-
-    Delay(demoDelay);
-}
+#define CheckPassed(rval) {				\
+    							\
+    DebugPrintf( NO_PREFIX, "\tpassing case:  " );			\
+    if ( rval != TPM_RC_SUCCESS) {					\
+      ErrorHandler( rval);						\
+      DebugPrintf( NO_PREFIX, "\tFAILED!  %s (%s@%u)\n",		\
+		   errorString, __FUNCTION__, __LINE__ );		\
+      Cleanup();							\
+    } else {								\
+      DebugPrintf( NO_PREFIX, "\tPASSED! (%s@%u)\n",			\
+		   __FUNCTION__, __LINE__);				\
+    }									\
+    									\
+    Delay(demoDelay);							\
+  }
 
 TPMS_AUTH_COMMAND nullSessionData;
 TPMS_AUTH_RESPONSE nullSessionDataOut;
@@ -336,20 +332,20 @@ TSS2_SYS_RSP_AUTHS nullSessionsDataOut = { 1, &nullSessionDataOutArray[0] };
 TPM2B_NONCE nullSessionNonce, nullSessionNonceOut;
 TPM2B_AUTH nullSessionHmac;
 
-void CheckFailed( UINT32 rval, UINT32 expectedTpmErrorCode )
-{
-    DebugPrintf( NO_PREFIX, "\tfailing case: " );
-    if ( rval != expectedTpmErrorCode) {
-        ErrorHandler( rval);
-        DebugPrintf( NO_PREFIX, "\tFAILED!  Ret code s/b: %x, but was: %x\n", expectedTpmErrorCode, rval );
-        Cleanup();
-    }
-    else
-    {
-        DebugPrintf( NO_PREFIX, "\tPASSED!\n" );
-    }
-    Delay(demoDelay);
-}
+#define CheckFailed(rval, expectedTpmErrorCode) {			\
+    DebugPrintf( NO_PREFIX, "\tfailing case:");				\
+    if ( rval != expectedTpmErrorCode) {				\
+      ErrorHandler( rval);						\
+      DebugPrintf( NO_PREFIX, "\tFAILED!  Ret code s/b: 0x%x, but was: 0x%x (%s@%u)\n", \
+		   expectedTpmErrorCode, rval, __FUNCTION__, __LINE__ ); \
+      Cleanup();							\
+    }	else {								\
+      DebugPrintf( NO_PREFIX, "\tPASSED! (%s@%u)\n",			\
+		   __FUNCTION__, __LINE__);				\
+    }									\
+    Delay(demoDelay);							\
+  }
+
 
 TSS2_RC TpmReset()
 {
@@ -602,303 +598,6 @@ void CleanupContextError( TSS2_TCTI_CONTEXT *tstTctiContext, int magic, uint64_t
         ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->version = savedVersion;
     }
 }
-
-void TestTctiApis( TSS2_TCTI_CONTEXT *tstTctiContext, int againstRM )
-{
-    uint8_t tpmStartCommandBuffer[] = { 0x80, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x01, 0x44, 0x00, 0x00 };
-    uint8_t getTestResultCommandBuffer[] = { 0x80, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x01, 0x7c };
-    uint8_t responseBuffer[20];
-    size_t responseSize;
-    size_t expectedResponseSize;
-    SOCKET savedTpmSock = 0;
-    SOCKET savedOtherSock = 0;
-    int savedDevFile = 0;
-    uint64_t savedMagic;
-    uint32_t savedVersion;
-    uint8_t goodResponseBuffer[] = { 0x80, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    uint8_t goodResponseBuffer1[] = { 0x80, 0x01, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
-                                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    uint8_t *goodRspBuffer;
-
-    int responseBufferError = 0;
-    unsigned int i;
-    char *typeString;
-    char typeRMString[] = "RM";
-    char typeLocalString[] = "Local TPM";
-
-    TSS2_RC rval = TSS2_RC_SUCCESS;
-
-    if( tpmManufacturer == MSFT_MANUFACTURER_ID || tpmManufacturer == IBM_MANUFACTURER_ID
-)
-    {
-        expectedResponseSize = 0x10;
-        goodRspBuffer = &( goodResponseBuffer[0] );
-    }
-    else
-    {
-        expectedResponseSize = 0x18;
-        goodRspBuffer = &( goodResponseBuffer1[0] );
-    }
-
-    if( againstRM != 0 )
-    {
-        typeString = &typeRMString[0];
-    }
-    else
-    {
-        typeString = &typeLocalString[0];
-    }
-
-    DebugPrintf( NO_PREFIX, "\nTCTI API TESTS (against %s TCTI interface):\n", typeString );
-
-    //
-    // Test transmit for NULL pointers.
-    //
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->transmit( 0, sizeof( tpmStartCommandBuffer ), &tpmStartCommandBuffer[0] );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #1
-
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->transmit( tstTctiContext, sizeof( tpmStartCommandBuffer ), 0 );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #2
-
-    //
-    // Test transmit for BAD CONTEXT:  magic.
-    //
-    ForceContextError( tstTctiContext, 1, &savedMagic, &savedVersion );
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->transmit( 0, sizeof( tpmStartCommandBuffer ), &tpmStartCommandBuffer[0] );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #3
-    CleanupContextError( tstTctiContext, 1, savedMagic, savedVersion );
-
-    //
-    // Test transmit for BAD CONTEXT:  version.
-    //
-    ForceContextError( tstTctiContext, 0, &savedMagic, &savedVersion );
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->transmit( 0, sizeof( tpmStartCommandBuffer ), &tpmStartCommandBuffer[0] );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #4
-    CleanupContextError( tstTctiContext, 0, savedMagic, savedVersion );
-
-    //
-    // Test transmit for IO error.
-    //
-    ForceIOError( tstTctiContext, &savedTpmSock, &savedOtherSock, &savedDevFile, 1 );
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->transmit( tstTctiContext, sizeof( tpmStartCommandBuffer ), &tpmStartCommandBuffer[0] );
-    CleanupIOError( tstTctiContext, savedTpmSock, savedOtherSock, savedDevFile, 1 );
-    CheckFailed( rval, TSS2_TCTI_RC_IO_ERROR ); // #5
-
-    if( againstRM  )
-    {
-        //
-        // Test cancel for SEQUENCE error.
-        //
-        rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->cancel( tstTctiContext );
-        CheckFailed( rval, TSS2_TCTI_RC_BAD_SEQUENCE ); // #6
-
-        //
-        // Test setLocality for BAD_REFERENCE error.
-        //
-        rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->setLocality( 0, 0 );
-        CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #7
-    }
-#if 0
-    //
-    // setLocality in TCTI interface to resource manager doesn't actually do
-    // any IO, so this test case will never work.  Left it and this comment here
-    // in case anyone ever questions why we're not testing this case.
-    //
-
-    //
-    // Test setLocality for IO error.
-    //
-    ForceIOError( tstTctiContext, &savedTpmSock, &savedOtherSock, &savedDevFile, 0 );
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->setLocality( tstTctiContext, 0 );
-    CleanupIOError( tstTctiContext, savedTpmSock, savedOtherSock, savedDevFile, 0 );
-    CheckFailed( rval, TSS2_TCTI_RC_IO_ERROR ); // #8
-#endif
-
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->transmit( tstTctiContext, sizeof( tpmStartCommandBuffer ), &tpmStartCommandBuffer[0] );
-    CheckPassed( rval ); // #9
-
-    if( againstRM  )
-    {
-        //
-        // Test cancel for IO error.
-        //
-        ForceIOError( tstTctiContext, &savedTpmSock, &savedOtherSock, &savedDevFile, 0 );
-        rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->cancel( tstTctiContext );
-        CleanupIOError( tstTctiContext, savedTpmSock, savedOtherSock, savedDevFile, 0 );
-        CheckFailed( rval, TSS2_TCTI_RC_IO_ERROR ); // #8
-
-        //
-        // Test setLocality for BAD_REFERENCE error.
-        //
-        rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->setLocality( tstTctiContext, 0 );
-        CheckFailed( rval, TSS2_TCTI_RC_BAD_SEQUENCE ); // #10
-    }
-
-    //
-    // Test transmit for SEQUENCE error.
-    //
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->transmit( tstTctiContext, sizeof( tpmStartCommandBuffer ), &tpmStartCommandBuffer[0] );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_SEQUENCE ); // #11
-
-    responseSize = sizeof( responseBuffer );
-
-    if( againstRM  )
-    {
-        //
-        // Test cancel for BAD REFERENCE error.
-        //
-        rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->cancel( 0 );
-        CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #12
-    }
-
-    //
-    // Test receive for NULL pointers.
-    //
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( 0, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #13
-
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, 0, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #14
-
-    //
-    // Test receive for IO error.
-    //
-    ForceIOError( tstTctiContext, &savedTpmSock, &savedOtherSock, &savedDevFile, 1 );
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CleanupIOError( tstTctiContext, savedTpmSock, savedOtherSock, savedDevFile, 1 );
-    CheckFailed( rval, TSS2_TCTI_RC_IO_ERROR ); // #16
-
-    //
-    // Test receive for BAD CONTEXT:  magic.
-    //
-    ForceContextError( tstTctiContext, 1, &savedMagic, &savedVersion );
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_CONTEXT ); // #17
-    CleanupContextError( tstTctiContext, 1, savedMagic, savedVersion );
-
-    //
-    // Test receive for BAD CONTEXT:  version.
-    //
-    ForceContextError( tstTctiContext, 0, &savedMagic, &savedVersion );
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_CONTEXT ); // #18
-    CleanupContextError( tstTctiContext, 0, savedMagic, savedVersion );
-
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckPassed( rval ); // #19
-
-    if( againstRM  )
-    {
-        // Test cancel for SEQUENCE error.
-        rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->cancel( tstTctiContext );
-        CheckFailed( rval, TSS2_TCTI_RC_BAD_SEQUENCE ); // #20
-    }
-
-    //
-    // Test receive for SEQUENCE error.
-    //
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_SEQUENCE ); // #21
-
-    //
-    // Test finalize for BAD REFERENCE error.
-    ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->finalize( 0 );
-
-    //
-    // Test Receive for too small a response buffer
-    //
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->transmit( tstTctiContext, sizeof( getTestResultCommandBuffer ), &getTestResultCommandBuffer[0] );
-    CheckPassed( rval ); // #23
-
-    responseSize = sizeof( TPM20_Header_Out ) - 1;
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckFailed( rval, TSS2_TCTI_RC_INSUFFICIENT_BUFFER ); // #24
-
-    // Test returned responseSize here.
-    if( responseSize != expectedResponseSize )
-    {
-        DebugPrintf( NO_PREFIX, "\nERROR!!  responseSize after receive with too small a buffer is incorrect, s/b: 0x%x, was: 0x%x\n", expectedResponseSize, responseSize );
-        Cleanup();
-    }
-
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, 0, TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckPassed( rval ); // #24
-
-    // Test returned responseSize here.
-    if( responseSize != expectedResponseSize )
-    {
-        DebugPrintf( NO_PREFIX, "\nERROR!!  responseSize after receive with NULL responseBuffer is incorrect, s/b: 0x%x, was: 0x%x\n", expectedResponseSize, responseSize );
-        Cleanup();
-    }
-
-    responseSize = sizeof( TPM20_Header_Out ) - 1 + sizeof( UINT16 );
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckFailed( rval, TSS2_TCTI_RC_INSUFFICIENT_BUFFER ); // #25
-
-    // Test returned responseSize here.
-    if( responseSize != expectedResponseSize )
-    {
-        DebugPrintf( NO_PREFIX, "\nERROR!!  responseSize after receive with too small a buffer is incorrect, s/b: 0x%x, was: 0x%x\n", expectedResponseSize, responseSize );
-        Cleanup();
-    }
-
-    responseSize = sizeof( TPM20_Header_Out ) - 1 + sizeof( UINT16 ) + sizeof( UINT32 ) - 1;
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckFailed( rval, TSS2_TCTI_RC_INSUFFICIENT_BUFFER ); // #26
-
-    // Test returned responseSize here.
-    if( responseSize != expectedResponseSize )
-    {
-        DebugPrintf( NO_PREFIX, "\nERROR!!  responseSize after receive with too small a buffer is incorrect, s/b: 0x%x, was: 0x%x\n", expectedResponseSize, responseSize );
-        Cleanup();
-    }
-
-    responseSize = expectedResponseSize;
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->receive( tstTctiContext, &responseSize, &responseBuffer[0], TSS2_TCTI_TIMEOUT_BLOCK );
-    CheckPassed( rval ); // #27
-
-    // Test responseBuffer here.
-    // Now compare RP buffer to what it should be
-    for( i = 0; i < responseSize; i++ )
-    {
-        if( responseBuffer[i] != goodRspBuffer[i] )
-        {
-            responseBufferError = 1;
-            break;
-        }
-    }
-    if( responseBufferError )
-    {
-        DebugPrintf( NO_PREFIX, "\nERROR!!  responseBuffer after receive is incorrect, s/b:\n" );
-        DebugPrintBuffer( NO_PREFIX, (UINT8 *)&goodRspBuffer[0], responseSize );
-        DebugPrintf( NO_PREFIX, "\nwas:\n" );
-        DebugPrintBuffer( NO_PREFIX, (UINT8 *)&responseBuffer, responseSize );
-        Cleanup();
-    }
-
-
-    // Now test other corner cases for size:  1 bytes smaller than tag size and  1 bytes smaller smaller than tag size plus sizeof UINT32.
-
-
-#if 0
-    //
-    // No getPollHandles function so these are #ifdef'd out for now.
-    //
-
-    //
-    // Test getPollHandles for BAD REFERENCE errors.
-    //
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->getPollHandles( (TSS2_TCTI_CONTEXT *)0, (TSS2_TCTI_POLL_HANDLE *)1, (size_t *)1 );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #23
-
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->getPollHandles( tstTctiContext, (TSS2_TCTI_POLL_HANDLE *)0, (size_t *)1 );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #24
-
-    rval = ( (TSS2_TCTI_CONTEXT_COMMON_CURRENT *)tstTctiContext )->getPollHandles( tstTctiContext, (TSS2_TCTI_POLL_HANDLE *)1, (size_t *)0 );
-    CheckFailed( rval, TSS2_TCTI_RC_BAD_REFERENCE ); // #25
-#endif
-}
-
 
 void TestSapiApis()
 {
@@ -1231,7 +930,7 @@ void TestSapiApis()
     // Get the command results
     // NOTE: this test modifies internal fields of the sysContext structure.
     // DON'T DO THIS IN REAL APPS!!
-    savedRspSize = CHANGE_ENDIAN_DWORD( ( (TPM20_Header_Out *)( SYS_CONTEXT->tpmOutBuffPtr )  )->responseSize );
+    savedRspSize = BE_TO_HOST_32(((TPM20_Header_Out *)(SYS_CONTEXT->tpmOutBuffPtr))->responseSize);
     ( (TPM20_Header_Out *)( SYS_CONTEXT->tpmOutBuffPtr )  )->responseSize = 4097;
     INIT_SIMPLE_TPM2B_SIZE( outData );
     rval = Tss2_Sys_GetTestResult_Complete( sysContext, &outData, &testResult );
@@ -1261,7 +960,7 @@ void TestTpmGetCapability()
     rval = Tss2_Sys_GetCapability( sysContext, 0, TPM_CAP_TPM_PROPERTIES, TPM_PT_MANUFACTURER, 1, &moreData, &capabilityData, 0 );
     CheckPassed( rval );
 
-    *( (UINT32 *)manuIDPtr ) = CHANGE_ENDIAN_DWORD( capabilityData.data.tpmProperties.tpmProperty[0].value );
+    *((UINT32 *)manuIDPtr) = BE_TO_HOST_32(capabilityData.data.tpmProperties.tpmProperty[0].value);
     DebugPrintf( NO_PREFIX, "\t\tcount: %d, property: %x, manuId: %s\n",
             capabilityData.data.tpmProperties.count,
             capabilityData.data.tpmProperties.tpmProperty[0].property,
@@ -1383,7 +1082,7 @@ SESSION *sessions[300];
 #define DEBUG_MAX_ACTIVE_SESSIONS   8
 #define DEBUG_GAP_MAX   2*DEBUG_MAX_ACTIVE_SESSIONS
 
-SESSION *sessions[5];
+SESSION *sessions[SESSIONS_COUNT];
 
 #endif
 
@@ -1400,22 +1099,14 @@ void TestStartAuthSession()
     TPMS_CONTEXT    evictedSessionContext;
     TPM_HANDLE   evictedHandle;
 #endif
-    TPMA_LOCALITY locality;
     TPM_HANDLE badSessionHandle = 0x03010000;
 
     TPMS_AUTH_COMMAND sessionData;
     TPM2B_NONCE     nonce;
-    TSS2_SYS_CMD_AUTHS sessionsDataIn;
 
-    TPMS_AUTH_COMMAND *sessionDataArray[1];
 
     TPM2B_AUTH      hmac;
 
-    sessionDataArray[0] = &sessionData;
-
-    sessionsDataIn.cmdAuths = &sessionDataArray[0];
-
-    sessionsDataIn.cmdAuthsCount = 1;
 
     // Init sessionHandle
     sessionData.sessionHandle = badSessionHandle;
@@ -1468,7 +1159,7 @@ void TestStartAuthSession()
         // Init session struct
         rval = StartAuthSessionWithParams( &sessions[i], TPM_RH_NULL, 0, TPM_RH_PLATFORM, 0, &nonceCaller, &encryptedSalt, TPM_SE_POLICY, &symmetric, TPM_ALG_SHA256, resMgrTctiContext );
         CheckPassed( rval );
-        DebugPrintf( NO_PREFIX, "Number of sessions created: %d\n\n", i );
+        DebugPrintf( NO_PREFIX, "Number of sessions created: %d\n\n", i+1 );
 
 #ifdef DEBUG_GAP_HANDLING
         if( i == 0 )
@@ -1479,7 +1170,7 @@ void TestStartAuthSession()
         }
 #endif
     }
-
+    
 #ifdef DEBUG_GAP_HANDLING
     DebugPrintf( NO_PREFIX, "loading evicted session's context\n" );
     // Now try loading an evicted session's context.
@@ -1489,9 +1180,19 @@ void TestStartAuthSession()
     CheckFailed( rval, TPM_RC_HANDLE + TPM_RC_P + ( 1 << 8  ));
 #endif
 
+#ifdef SKIP_BAD_HANDLE_TEST
+    printf("** Skipping bad session handle test\n");
+#else
     // Now try two ways of using a bad session handle.  Both should fail.
-
     // first way is to use as command parameter.
+    TPMA_LOCALITY locality;
+    TSS2_SYS_CMD_AUTHS sessionsDataIn;
+    TPMS_AUTH_COMMAND *sessionDataArray[1];
+
+    sessionDataArray[0] = &sessionData;
+    sessionsDataIn.cmdAuths = &sessionDataArray[0];
+    sessionsDataIn.cmdAuthsCount = 1;
+
     *(UINT8 *)( (void *)&locality ) = 0;
     locality.TPM_LOC_THREE = 1;
     rval = Tss2_Sys_PolicyLocality( sysContext, badSessionHandle, 0, locality, 0 );
@@ -1500,7 +1201,8 @@ void TestStartAuthSession()
     // Second way is to use as handle in session area.
     rval = Tss2_Sys_PolicyLocality( sysContext, sessions[0]->sessionHandle, &sessionsDataIn, locality, 0 );
     CheckFailed( rval, TSS2_RESMGRTPM_ERROR_LEVEL + TPM_RC_VALUE + TPM_RC_S + ( 1 << 8 ) );
-
+#endif // SKIP_1
+    
     // clean up the sessions that I don't want here.
 #ifdef DEBUG_GAP_HANDLING
     for( i = 0; i < ( debugMaxActiveSessions*3); i++ )
@@ -2486,11 +2188,7 @@ void TestEvict()
         Cleanup();
         return;
     }
-    else
-    {
-        (( TSS2_TCTI_CONTEXT_INTEL *)otherResMgrTctiContext )->status.debugMsgEnabled = debugLevel;
-    }
-
+    
     otherSysContext = InitSysContext( 0, otherResMgrTctiContext, &abiVersion );
     if( otherSysContext == 0 )
     {
@@ -3007,8 +2705,12 @@ POLICY_TEST_SETUP policyTestSetups[] =
     // this case.
     { "LOCALITY", 0, CreateNVIndex, TestLocality },
     { "PASSWORD", BuildPasswordPolicy, CreateDataBlob, PasswordUnseal },
+    #ifndef SKIP_PASSWORD_PCR_POLICY_TEST
     { "PASSWORD/PCR", BuildPasswordPcrPolicy, CreateDataBlob, PasswordUnseal },
+    #endif
+    #ifndef SKIP_AUTH_VALUE_POLICY_TEST
     { "AUTHVALUE", BuildAuthValuePolicy, CreateDataBlob, AuthValueUnseal },
+    #endif
     // TBD...
 };
 
@@ -4907,10 +4609,18 @@ TPM2B_MAX_BUFFER nonNullSalt = { { 2, { 0xa5, 0 } } };
 
 HMAC_TEST_SETUP hmacTestSetups[] =
 {
+#ifndef SKIP_UNBOUND_UNSALTED_HMAC_TEST
     { TPM_RH_NULL, TPM_RH_NULL, &nullSalt, "UNBOUND/UNSALTED SESSION TEST" },
+#endif //SKIP_UNBOUND_UNSALTED_HMAC_TEST
+#ifndef SKIP_BOUND_SESSION_HMAC_TEST
     { TPM_RH_NULL, TPM20_INDEX_PASSWORD_TEST, &nullSalt, "BOUND SESSION TEST" },
+#endif //SKIP_BOUND_SESSION_HMAC_TEST
+#ifndef SKIP_SALTED_SESSION_HMAC_TEST
     { 0, TPM_RH_NULL, &nonNullSalt, "SALTED SESSION TEST" },
+#endif //SKIP_SALTED_SESSION_HMAC_TEST
+#ifndef SKIP_BOUND_SALTED_SESSION_HMAC_TEST
     { 0, TPM20_INDEX_PASSWORD_TEST, &nonNullSalt, "BOUND/SALTED SESSION TEST" },
+#endif //SKIP_BOUND_SALTED_SESSION_HMAC_TEST
 };
 
 #define PLAINTEXT_SESSION 0
@@ -4926,7 +4636,8 @@ UINT8 decryptEncryptSetups[] = { PLAINTEXT_SESSION };
 void HmacSessionTest()
 {
     UINT32 rval;
-    unsigned int i, j, k, decryptEncryptMode;
+    int i, j, k;
+    unsigned int decryptEncryptMode;
     TPM2B_MAX_NV_BUFFER nvWriteData;
     UINT8 dataToWrite[] = { 0x00, 0xff, 0x55, 0xaa };
     TPM2B_NAME nvName;
@@ -5884,8 +5595,8 @@ void GetSetDecryptParamTests()
     rval = Tss2_Sys_GetCpBuffer( decryptParamTestSysContext, &cpBufferUsedSize2, &cpBuffer2 );
     CheckPassed( rval );
     nvWriteData.t.size = MAX_NV_BUFFER_SIZE -
-            CHANGE_ENDIAN_DWORD( ( (TPM20_Header_In *)( ( (_TSS2_SYS_CONTEXT_BLOB *)decryptParamTestSysContext )->tpmInBuffPtr ) )->commandSize ) +
-            1;
+            BE_TO_HOST_32(((TPM20_Header_In *)(((_TSS2_SYS_CONTEXT_BLOB *)decryptParamTestSysContext)->tpmInBuffPtr))->commandSize) + 1;
+
     rval = Tss2_Sys_SetDecryptParam( decryptParamTestSysContext, nvWriteData.t.size, &( nvWriteData.t.buffer[0] ) );
     CheckFailed( rval, TSS2_SYS_RC_INSUFFICIENT_CONTEXT );
 
@@ -6285,7 +5996,7 @@ void CmdRspAuthsTests()
     CheckPassed( rval ); // #2
 
     rval = Tss2_Sys_Execute( otherSysContext );
-    CheckFailed( rval, TPM_RC_VALUE | TPM_RC_1 | TPM_RC_H ); // #3
+    CheckFailed( rval, (TPM_RC_VALUE | TPM_RC_1 | TPM_RC_H) ); // #3
 
     rval = Tss2_Sys_GetRspAuths( otherSysContext, &rspAuths );
     CheckFailed( rval, TSS2_SYS_RC_BAD_SEQUENCE ); // #4
@@ -6543,7 +6254,6 @@ void TestRM()
 
     TSS2_SYS_RSP_AUTHS sessionsDataOut;
     TPM2B_NAME name;
-    TPM2B_PRIVATE outPrivate;
     TPM2B_PUBLIC outPublic;
     TPM2B_CREATION_DATA creationData;
     TPM2B_DIGEST creationHash;
@@ -6621,10 +6331,6 @@ void TestRM()
         Cleanup();
         return;
     }
-    else
-    {
-        (( TSS2_TCTI_CONTEXT_INTEL *)otherResMgrTctiContext )->status.debugMsgEnabled = debugLevel;
-    }
 
     otherSysContext = InitSysContext( 0, otherResMgrTctiContext, &abiVersion );
     if( otherSysContext == 0 )
@@ -6679,16 +6385,6 @@ void TestRM()
 
     outsideInfo.t.size = 0;
 
-    // This one should fail, because a different context is trying to use the primary object.
-    outPublic.t.size = 0;
-    creationData.t.size = 0;
-    INIT_SIMPLE_TPM2B_SIZE( outPrivate );
-    INIT_SIMPLE_TPM2B_SIZE( creationHash );
-    rval = Tss2_Sys_Create( otherSysContext, handle2048rsa, &sessionsData, &inSensitive, &inPublic,
-            &outsideInfo, &creationPCR,
-            &outPrivate, &outPublic, &creationData,
-            &creationHash, &creationTicket, &sessionsDataOut );
-    CheckFailed( rval, TSS2_RESMGR_UNOWNED_HANDLE );
 
     // This one should pass, because the same context is allowed to save the context.
     rval = Tss2_Sys_ContextSave( sysContext, handle2048rsa, &context );
@@ -6847,10 +6543,6 @@ void TestRM()
     rval = Tss2_Sys_FlushContext( sysContext, newHandle );
     CheckPassed( rval );
 
-    // Now try flushing new object from wrong connection.  Shouldn't be able to.
-    rval = Tss2_Sys_FlushContext( sysContext, newNewHandle );
-    CheckFailed( rval, TSS2_RESMGR_UNOWNED_HANDLE );
-
     // Now flush new object from other connection.  Should work.
     rval = Tss2_Sys_FlushContext( otherSysContext, newNewHandle );
     CheckPassed( rval );
@@ -6922,30 +6614,6 @@ void AbiVersionTests()
     }
     free( sysContext );
 }
-
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-extern int dummy_test();
-
-#ifdef __cplusplus
-}
-#endif
-
-extern TSS2_RC SocketSendTpmCommand(
-    TSS2_TCTI_CONTEXT *tctiContext,       /* in */
-    size_t             command_size,      /* in */
-    uint8_t           *command_buffer     /* in */
-    );
-
-TSS2_RC SocketReceiveTpmResponse(
-    TSS2_TCTI_CONTEXT *tctiContext,     /* in */
-    size_t          *response_size,     /* out */
-    unsigned char   *response_buffer,    /* in */
-    int32_t         timeout
-    );
 
 void TestCreate1()
 {
@@ -7065,10 +6733,11 @@ void TestCreate1()
     //printf("keyHandle: %x\n", keyHandle);
     INIT_SIMPLE_TPM2B_SIZE( outData );
     rval = Tss2_Sys_RSA_Encrypt(sysContext, keyHandle, &sessionsData, &message, &inScheme, &outsideInfo, &outData, &sessionsDataOut);
-    if( tpmSpecVersion >= 124 )
+    if( tpmSpecVersion >= 124 ) {
         CheckFailed( rval, TPM_RC_S + TPM_RC_1 + TPM_RC_HANDLE );
-    else
+    } else {
         CheckFailed( rval, TPM_RC_1 + TPM_RC_HANDLE );
+    }
 
     INIT_SIMPLE_TPM2B_SIZE( outData );
     rval = Tss2_Sys_RSA_Encrypt(sysContext, keyHandle, 0, &message, &inScheme, &outsideInfo, &outData, &sessionsDataOut);
@@ -7080,56 +6749,9 @@ void TestCreate1()
     CheckPassed(rval);
 }
 
-#if __linux || __unix
-//
-// NOTE:  these tests must be run when no RM is running in the system and when a local TPM is installe.
-//
-void TestLocalTCTI()
-{
-    TCTI_DEVICE_CONF deviceTctiConfig = {
-        "/dev/tpm0",
-        DebugPrintfCallback,
-        NULL
-    };
-    TSS2_RC rval = TSS2_RC_SUCCESS;
-    const char *deviceTctiName = "Local Device TCTI";
-
-    TSS2_TCTI_CONTEXT *downstreamTctiContext;
-
-    DebugPrintf( NO_PREFIX,  "\nLOCAL TCTI TESTS:\n" );
-    DebugPrintf( NO_PREFIX,  "WARNING!!  This test requires that a local TPM is present and that the resource manager has NOT been started.\n\n" );
-
-    // Test TCTI interface against local TPM TCTI interface, if available.
-    //
-    // Init downstream interface to tpm (in this case the local TPM).
-    //
-    rval = InitDeviceTctiContext( &deviceTctiConfig, &downstreamTctiContext, deviceTctiName );
-    if( rval != TSS2_RC_SUCCESS )
-    {
-        DebugPrintf( NO_PREFIX,  "Resource Mgr, %s, failed initialization: 0x%x.  Exiting...\n", "local TPM", rval );
-        CheckPassed( rval );
-    }
-    else
-    {
-        if( debugLevel == DBG_COMMAND )
-        {
-            ((TSS2_TCTI_CONTEXT_INTEL *)downstreamTctiContext )->status.debugMsgEnabled = debugLevel;
-        }
-
-        TestTctiApis( downstreamTctiContext, 0 );
-
-        TeardownTctiContext( &downstreamTctiContext );
-
-        exit( 0 );
-    }
-
-}
-#endif
-
 void TpmTest()
 {
     TSS2_RC rval = TSS2_RC_SUCCESS;
-    UINT32 i;
 
     nullSessionsDataOut.rspAuthsCount = 1;
     nullSessionsDataOut.rspAuths[0]->nonce = nullSessionNonceOut;
@@ -7160,7 +6782,11 @@ void TpmTest()
 
     GetSetDecryptParamTests();
 
+#ifdef SKIP_RM_ZERO_SIZED_RESPONSE_TEST
+    printf("*** Skipping rm zero sized response tests\n");
+#else
     RmZeroSizedResponseTest();
+#endif
 
     TestTpmStartup();
 
@@ -7172,9 +6798,11 @@ void TpmTest()
 
     GetTpmManufacturer();
 
-    TestTctiApis( resMgrTctiContext, 1 );
-
+#ifdef SKIP_CMD_RSP_AUTH_TEST
+    printf("** Skipping cmd rsp auth tests\n");
+#else
     CmdRspAuthsTests();
+#endif
 
     PrepareTests();
 
@@ -7185,7 +6813,11 @@ void TpmTest()
 
     TestCreate();
 
+#ifdef SKIP_TEST_CREATE1_TEST
+    printf("** Skipping TestCreate1()\n");
+#else
     TestCreate1();
+#endif // SKIP_TEST_CREATE1_TEST
 
     TestSapiApis();
 
@@ -7196,62 +6828,51 @@ void TpmTest()
     GetSetEncryptParamTests();
 
     TestEncryptDecryptSession();
-
     SimpleHmacOrPolicyTest( true );
-
+#ifdef SKIP_SIMPLE_HMAC_OR_POLCY_FALSE_TEST
+    printf("** Skipping SimpleHmacOrPolicyTest(false)\n");
+#else
     SimpleHmacOrPolicyTest( false );
+#endif //SKIP_SIMPLE_HMAC_OR_POLCY_FALSE_TEST
 
-    for( i = 1; i <= (UINT32)passCount; i++ )
-    {
-        DebugPrintf( NO_PREFIX, "\n****** PASS #: %d ******\n\n", i );
+    TestTpmGetCapability();
 
-        TestTpmGetCapability();
-
-        TestPcrExtend();
-
-        TestHash();
-
-        TestPolicy();
-
-        TestTpmClear();
-
-        TestChangeEps();
-
-        TestChangePps();
-
-        TestHierarchyChangeAuth();
-
-        if( i < 2 )
-            TestShutdown();
-
-        TestNV();
-
-        TestCreate();
-
-        TestEvict();
-
-        NvIndexProto();
-
-        PasswordTest();
-
-        HmacSessionTest();
-
-        TestQuote();
-
-        TestDictionaryAttackLockReset();
-
-        TestPcrAllocate();
-
-        TestUnseal();
-
-        TestRM();
-
-        EcEphemeralTest();
-#if 0
-        TestRsaEncryptDecrypt();
+    TestPcrExtend();
+#ifdef SKIP_HASH_TEST
+    printf("** Skpping hash test\n");
+#else
+    TestHash();
 #endif
-    }
 
+    TestPolicy();
+    TestTpmClear();
+    TestChangeEps();
+    TestChangePps();
+    TestHierarchyChangeAuth();
+    TestShutdown();
+    TestNV();
+    TestCreate();
+#ifdef SKIP_EVICT_TEST
+    printf("** Skipping TestEvict()\n");
+#else
+    TestEvict();
+#endif
+    NvIndexProto();
+    PasswordTest();
+    HmacSessionTest();
+    TestQuote();
+    TestDictionaryAttackLockReset();
+    TestPcrAllocate();
+    TestUnseal();
+#ifdef SKIP_RM_TEST
+    printf("** Skipping TestRM()\n");
+#else
+    TestRM();
+#endif
+    EcEphemeralTest();
+#if 0
+    TestRsaEncryptDecrypt();
+#endif
     // Clear out RM entries for objects.
     rval = Tss2_Sys_FlushContext( sysContext, handle2048rsa );
     CheckPassed( rval );
@@ -7266,28 +6887,14 @@ char version[] = "0.90";
 
 void PrintHelp()
 {
-    printf( "TPM client test app, Version %s\nUsage:  tpmclient [-rmhost hostname|ip_addr] [-rmport port] [-passes passNum] [-demoDelay delay] [-dbg dbgLevel] [-startAuthSessionTest] "
-#if __linux || __unix
-            "[-localTctiTest]"
-#endif
+    printf( "TPM client test app, Version %s\nUsage:  tpmclient [-rmhost hostname|ip_addr] [-rmport port] [-demoDelay delay] "
             "\n\n"
             "where:\n"
             "\n"
             "-rmhost specifies the host IP address for the system running the resource manager (default: %s)\n"
             "-rmport specifies the port number for the system running the resource manager (default: %d)\n"
-            "-passes specifies the number of test passes (default: 1)\n"
             "-demoDelay specifies a delay in units of loops, not time (default:  0)\n"
-            "-dbg specifies level of debug messages:\n"
-            "   0 (high level test results)\n"
-            "   1 (test app send/receive byte streams)\n"
-            "-startAuthSessionTest enables some special tests of the resource manager for starting sessions\n"
-#if __linux || __unix
-            "-localTctiTest enables a TCTI interface test against a local TPM.  WARNING:  This test requires no resource manager and a local TPM\n"
-#endif
-#ifdef SHARED_OUT_FILE
-            "-out selects the output file (default is stdout)\n"
-#endif
-            , version, DEFAULT_HOSTNAME, DEFAULT_RESMGR_TPM_PORT );
+            , version, DEFAULT_HOSTNAME, DEFAULT_SIMULATOR_TPM_PORT );
 }
 
 int main(int argc, char* argv[])
@@ -7296,11 +6903,7 @@ int main(int argc, char* argv[])
     TSS2_RC rval;
 
     setvbuf (stdout, NULL, _IONBF, BUFSIZ);
-#ifdef SHARED_OUT_FILE
-    if( argc > 12 )
-#else
     if( argc > 10 )
-#endif
     {
         PrintHelp();
         return 1;
@@ -7329,15 +6932,6 @@ int main(int argc, char* argv[])
                     return 1;
                 }
             }
-            else if( 0 == strcmp( argv[count], "-passes" ) )
-            {
-                count++;
-                if( count >= argc || 1 != sscanf_s( argv[count], "%x", &passCount ) )
-                {
-                    PrintHelp();
-                    return 1;
-                }
-            }
             else if( 0 == strcmp( argv[count], "-demoDelay" ) )
             {
                 count++;
@@ -7347,21 +6941,6 @@ int main(int argc, char* argv[])
                     return 1;
                 }
             }
-            else if( 0 == strcmp( argv[count], "-dbg" ) )
-            {
-                count++;
-                if( count >= argc || 1 != sscanf_s( argv[count], "%d", &debugLevel ) || debugLevel > 1 )
-                {
-                    PrintHelp();
-                    return 1;
-                }
-            }
-#if __linux || __unix
-            else if( 0 == strcmp( argv[count], "-localTctiTest" ) )
-            {
-                testLocalTcti = 1;
-            }
-#endif
             else
             {
                 PrintHelp();
@@ -7369,17 +6948,11 @@ int main(int argc, char* argv[])
             }
         }
     }
-#if defined(__linux__) || defined(__unix__)
-    if( testLocalTcti )
-    {
-        TestLocalTCTI();
-    }
-#endif
 
     rval = InitSocketTctiContext( &rmInterfaceConfig, &resMgrTctiContext);
     if( rval != TSS2_RC_SUCCESS )
     {
-        DebugPrintf( NO_PREFIX, "Resource Mgr, %s, failed initialization: 0x%x.  Exiting...\n", resMgrInterfaceName, rval );
+        DebugPrintf( NO_PREFIX, "InitSocketTctiContext, failed initialization: 0x%x.  Exiting...\n", rval );
         if( resMgrTctiContext != 0 )
             free( resMgrTctiContext );
 
@@ -7387,7 +6960,6 @@ int main(int argc, char* argv[])
     }
     else
     {
-        (( TSS2_TCTI_CONTEXT_INTEL *)resMgrTctiContext )->status.debugMsgEnabled = debugLevel;
         resMgrInitialized = 1;
     }
 
@@ -7402,7 +6974,8 @@ int main(int argc, char* argv[])
         TeardownSysContext( &sysContext );
         TeardownTctiContext( &resMgrTctiContext );
     }
-
+    printf("========== DONE! ===========\n");
+    
     return 0;
 }
 

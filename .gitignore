@@ -15,6 +15,11 @@
 .deps/
 .dirstamp
 .libs
+*~
+.*.swp
+.*.swo
+*.patch
+tags
 aclocal.m4
 autom4te.cache/
 [Bb]uild/
@@ -32,6 +37,7 @@ libtool
 ltmain.sh
 m4/libtool*
 m4/lt*.m4
+man/man[0-9]/*
 Makefile
 Makefile.in
 missing
@@ -50,10 +56,7 @@ ipch/
 test/tpmtest/tpmtest
 test-driver
 test-suite.log
-test/*_unit
-test/*.pid
 test/ibmtpm*
-test/simulator*
 # ignore all files in test/unit without a file extension
 test/unit/*
-!test/unit/*.[ch]
+test/unit/!*.*
